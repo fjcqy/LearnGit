@@ -1,0 +1,211 @@
+#名字和邮箱
+git config --global user.name "fjcqy"
+git config --global user.email "371918080@qq.com"
+
+#换行符自动转换
+git config --global core.autocrlf false
+#换行符检查
+git config --global core.safecrlf true
+
+#显示颜色
+git config --global color.ui true
+
+#中文乱码
+git config --global gui.encoding utf-8
+
+============创建版本库
+
+#初始化一个Git仓库：把当前目录设为仓库
+git init
+
+#工作区（Working Directory）
+
+#添加工作区内容到暂存区（stage）
+git add <file>
+
+#提交暂存区内容到版本库（Repository）
+git commit
+git commit -m "introduction"
+
+============时光机穿梭
+
+#工作区的状态
+git status
+
+#查看修改内容
+git diff
+
+============版本回退
+
+#查看提交历史
+git log
+
+#查看提交历史，简略模式
+git log --pretty=oneline
+
+#查看命令历史
+git reflog
+
+#返回之前的版本
+git reset --hard <commit_id>
+
+#返回上个版本
+git reset --hard HEAD^
+# HEAD表示当前版本，HEAD^上个版本，HEAD^^上上个版本，HEAD~100 往上100个版本
+
+============管理修改
+
+#查看工作区和版本库里面最新版本的区别
+git diff HEAD -- <file>
+
+============撤销修改
+
+#撤销工作区的修改，回到暂存区或版本库的状态
+git checkout -- <file>
+
+#把暂存区的修改撤销掉（unstage），重新放回工作区
+git reset HEAD <file>
+
+#返回之前的版本
+git reset --hard <commit_id>
+
+============
+
+#删除文件
+git rm <file>
+
+#------
+git checkout -- <file>
+
+============远程仓库
+
+创建SSH Key
+ssh-keygen -t rsa -C "youremail@example.com"
+ssh-keygen -t rsa -C "3719198080@qq.com"
+
+#移除远程ssh方式的仓库地址
+git remote rm origin
+#增加远程ssh方式的仓库地址
+git remote add origin git@github.com:fjcqy/GitTest.git
+#修改远程仓库地址
+git remote origin set-url [url]
+
+============添加远程库
+
+#把本地master分支的最新修改推送至远程库
+#第一次推送 -u，把本地的master分支和远程的master分支关联起来
+git push -u origin master
+
+#之后把本地master分支的最新修改推送至远程库
+git push origin master
+
+============从远程仓库克隆
+
+#克隆一个本地库
+git clone git@github.com:fjcqy/GitTest.git
+
+#https协议，每次推送都必须输入口令
+https://github.com/fjcqy/gitskills.git
+
+============创建与合并分支
+
+查看分支：git branch
+
+创建分支：git branch <name>
+
+切换分支：git checkout <name>
+
+创建+切换分支：git checkout -b <name>
+
+合并某分支到当前分支：git merge <name>
+
+删除分支：git branch -d <name>
+
+============解决冲突
+
+#分支合并图
+git log --graph
+
+============分支管理策略
+
+#合并某分支到当前分支，禁用Fast forward模式，合并后的历史有分支，能看出来曾经做过合并
+git merge --no-ff -m "merge with no-ff" dev
+
+master分支仅用来发布新版本
+dev分支用于开发
+issue-xxx分支用于修复BUG
+
+============Bug分支
+
+#把当前工作现场“储藏”起来，等以后恢复现场后继续工作
+git stash
+
+#查看保存的现场
+git stash list
+
+#恢复现场，但不会删除
+git stash apply
+
+#删除保存的现场
+git stash drop
+
+#恢复现场，同时删除保存的现场
+git stash pop
+
+============Feature分支
+
+#强行删除分支：分支还没有被合并，如果删除，将丢失掉修改
+git branch -D <name>
+
+============多人协作
+
+查看远程库信息，使用git remote；
+
+查看远程库详细信息，使用git remote -v；
+
+从本地推送分支，使用git push origin branch-name，如果推送失败，先用git pull抓取远程的新提交；
+
+在本地创建和远程分支对应的分支，使用git checkout -b branch-name origin/branch-name，本地和远程分支的名称最好一致；
+
+建立本地分支和远程分支的关联，使用git branch --set-upstream branch-name origin/branch-name；
+
+从远程抓取分支，使用git pull，如果有冲突，要先处理冲突。
+
+============
+
+#查看所有标签
+git tag
+
+#在最新提交的commit上打一个新标签
+git tag <name>
+
+#给历史的commit打一个新标签
+git tag <name> <commit id>
+
+#查看标签信息
+git show <tagname>
+
+#创建带有说明的标签，用-a指定标签名，-m指定说明文字
+git tag -a <name> -m "xxx" <commit id>
+
+命令git push origin <tagname>可以推送一个本地标签；
+
+命令git push origin --tags可以推送全部未推送过的本地标签；
+
+命令git tag -d <tagname>可以删除一个本地标签；
+
+命令git push origin :refs/tags/<tagname>可以删除一个远程标签。
+
+============配置别名
+
+git config --global alias.co checkout
+git config --global alias.cm commit
+git config --global alias.br branch
+git config --global alias.st status
+git config --global alias.lg "log --color --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset' --abbrev-commit"
+
+============
+============
+============
+============
+============
