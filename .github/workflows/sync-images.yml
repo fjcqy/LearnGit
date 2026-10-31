@@ -1,40 +1,146 @@
 name: Sync Docker Image
 
 on:
-  workflow_dispatch: # 允许手动触发
+  workflow_dispatch:
     inputs:
       source_image:
-        description: '源镜像地址 (例如: registry.k8s.io/kube-apiserver:v1.27.4)'
+        description: '源镜像地址'
         required: true
+        default: 'codeberg.org/forgejo/forgejo:16.0.7'
         type: string
       target_registry:
-        description: '选择目标镜像仓库'
+        description: '目标镜像仓库'
         required: true
         type: choice
         options:
           - ccr.ccs.tencentyun.com
+      target_namespace:
+        description: '目标命名空间'
+        required: true
+        default: 'gotodev'
+        type: string
+      target_repo:
+        description: '目标镜像名（留空则取源镜像最后一段）'
+        required: false
+        default: ''
+        type: string
+      target_tag:
+        description: '目标 tag（留空则用源 tag）'
+        required: false
+        default: ''
+        type: string
+
+  # 推送本文件即自动同步，省去手动点 Run workflow（本机没有 PAT 时用这条链路）
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/sync-images.yml'
+
+# 同一时间只跑一个同步任务，避免并发写同一 tag
+concurrency:
+  group: sync-docker-image
+  cancel-in-progress: false
+
+env:
+  DEFAULT_SOURCE_IMAGE: codeberg.org/forgejo/forgejo:16.0.7
+  DEFAULT_TARGET_REGISTRY: ccr.ccs.tencentyun.com
+  DEFAULT_TARGET_NAMESPACE: gotodev
 
 jobs:
   sync-image:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Resolve source and target
+        id: params
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="${{ inputs.source_image || env.DEFAULT_SOURCE_IMAGE }}"
+          REGISTRY="${{ inputs.target_registry || env.DEFAULT_TARGET_REGISTRY }}"
+          NAMESPACE="${{ inputs.target_namespace || env.DEFAULT_TARGET_NAMESPACE }}"
 
-      # 根据选择的目标仓库动态登录
-      - name: Login to Target Registry
+          # 拆分 registry/路径:tag；没有 tag 时默认 latest
+          SRC_TAG="latest"
+          SRC_NO_TAG="$SRC"
+          if [[ "$SRC" == *:* && "${SRC##*/}" == *:* ]]; then
+            SRC_TAG="${SRC##*:}"
+            SRC_NO_TAG="${SRC%:*}"
+          fi
+
+          REPO="${{ inputs.target_repo }}"
+          REPO="${REPO:-${SRC_NO_TAG##*/}}"
+          TAG="${{ inputs.target_tag }}"
+          TAG="${TAG:-$SRC_TAG}"
+
+          echo "source=$SRC" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "registry=$REGISTRY" >> "$GITHUB_OUTPUT"
+          echo "target=$REGISTRY/$NAMESPACE/$REPO:$TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 镜像同步"
+            echo ""
+            echo "- 源：\`$SRC\`"
+            echo "- 目标：\`$REGISTRY/$NAMESPACE/$REPO:$TAG\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Login to target registry
         uses: docker/login-action@v3
         with:
-          registry: ${{ github.event.inputs.target_registry }}
+          registry: ${{ steps.params.outputs.registry }}
           username: ${{ secrets.TENCENTYUN_REGISTRY_USERNAME }}
           password: ${{ secrets.TENCENTYUN_REGISTRY_PASSWORD }}
 
-      # 使用 skopeo 进行镜像同步
-      - name: Sync Image with Skopeo
+      - name: Install skopeo
         run: |
-          # 从源地址中提取镜像名和Tag，用于生成目标地址
-          IMAGE_NAME=$(echo "${{ github.event.inputs.source_image }}" | awk -F'/' '{print $NF}')
-          TARGET_IMAGE="${{ github.event.inputs.target_registry }}/${{ secrets.TENCENTYUN_REGISTRY_NAMESPACE }}/${IMAGE_NAME}"
-          
-          echo "正在同步: ${{ github.event.inputs.source_image }} -> $TARGET_IMAGE"
-          skopeo copy --all docker://${{ github.event.inputs.source_image }} docker://$TARGET_IMAGE
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo
+          skopeo --version
+
+      # 逐级回退：先原样搬 multi-arch index，再转 Docker schema2，最后只取 amd64
+      - name: Copy image
+        id: copy
+        shell: bash
+        run: |
+          set -uo pipefail
+          SRC="${{ steps.params.outputs.source }}"
+          DST="${{ steps.params.outputs.target }}"
+
+          try_copy() {
+            local label="$1"; shift
+            echo "::group::skopeo copy ($label)"
+            if skopeo copy --retry-times 3 "$@" "docker://$SRC" "docker://$DST"; then
+              echo "::endgroup::"
+              echo "mode=$label" >> "$GITHUB_OUTPUT"
+              return 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::$label 失败，尝试下一档"
+            return 1
+          }
+
+          try_copy "all-oci" --all && exit 0
+          try_copy "all-v2s2" --all --format v2s2 && exit 0
+          try_copy "amd64-v2s2" --override-os linux --override-arch amd64 --format v2s2 && exit 0
+
+          echo "::error::所有复制方式都失败"
+          exit 1
+
+      - name: Verify pushed image
+        shell: bash
+        run: |
+          set -euo pipefail
+          DST="${{ steps.params.outputs.target }}"
+          skopeo inspect --raw "docker://$DST" > /tmp/manifest.json
+          echo "已推送：$DST"
+          python3 - <<'PY'
+          import json, os
+          d = json.load(open('/tmp/manifest.json'))
+          ms = d.get('manifests')
+          if ms:
+              plats = sorted({f"{m.get('platform',{}).get('os','?')}/{m.get('platform',{}).get('architecture','?')}"
+                              for m in ms})
+              print("平台：" + ", ".join(plats))
+          else:
+              print("平台：单架构 manifest")
+          PY
+          echo "- 验证通过：\`$DST\`（${{ steps.copy.outputs.mode }}）" >> "$GITHUB_STEP_SUMMARY"
