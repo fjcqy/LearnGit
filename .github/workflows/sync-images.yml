@@ -8,6 +8,11 @@ on:
         required: true
         default: 'codeberg.org/forgejo/forgejo:16.0.7'
         type: string
+      source_mirror:
+        description: '备用源（主源拉取失败时自动尝试；留空则跳过）'
+        required: false
+        default: 'code.forgejo.org/forgejo/forgejo:16.0.7'
+        type: string
       target_registry:
         description: '目标镜像仓库'
         required: true
@@ -36,19 +41,23 @@ on:
     paths:
       - '.github/workflows/sync-images.yml'
 
-# 同一时间只跑一个同步任务，避免并发写同一 tag
+# 新的同步任务会顶掉队列里旧的，避免一次失败把后续都堵死
 concurrency:
   group: sync-docker-image
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   DEFAULT_SOURCE_IMAGE: codeberg.org/forgejo/forgejo:16.0.7
+  DEFAULT_SOURCE_MIRROR: code.forgejo.org/forgejo/forgejo:16.0.7
   DEFAULT_TARGET_REGISTRY: ccr.ccs.tencentyun.com
   DEFAULT_TARGET_NAMESPACE: gotodev
+  # 拉到本地 OCI 目录，pull 与 push 彻底解耦
+  OCI_LAYOUT: /tmp/oci-image
 
 jobs:
   sync-image:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - name: Resolve source and target
         id: params
@@ -56,32 +65,90 @@ jobs:
         run: |
           set -euo pipefail
           SRC="${{ inputs.source_image || env.DEFAULT_SOURCE_IMAGE }}"
+          MIRROR="${{ inputs.source_mirror || env.DEFAULT_SOURCE_MIRROR }}"
           REGISTRY="${{ inputs.target_registry || env.DEFAULT_TARGET_REGISTRY }}"
           NAMESPACE="${{ inputs.target_namespace || env.DEFAULT_TARGET_NAMESPACE }}"
 
-          # 拆分 registry/路径:tag；没有 tag 时默认 latest
-          SRC_TAG="latest"
-          SRC_NO_TAG="$SRC"
-          if [[ "$SRC" == *:* && "${SRC##*/}" == *:* ]]; then
-            SRC_TAG="${SRC##*:}"
-            SRC_NO_TAG="${SRC%:*}"
-          fi
+          # 拆分 tag；没有 tag 时默认 latest
+          split_tag() {
+            local ref="$1" tag="latest" notag="$1"
+            if [[ "$ref" == *:* && "${ref##*/}" == *:* ]]; then
+              tag="${ref##*:}"
+              notag="${ref%:*}"
+            fi
+            printf '%s\n%s\n' "$notag" "$tag"
+          }
+
+          mapfile -t PARTS < <(split_tag "$SRC")
+          SRC_NO_TAG="${PARTS[0]}"; SRC_TAG="${PARTS[1]}"
 
           REPO="${{ inputs.target_repo }}"
           REPO="${REPO:-${SRC_NO_TAG##*/}}"
           TAG="${{ inputs.target_tag }}"
           TAG="${TAG:-$SRC_TAG}"
 
-          echo "source=$SRC" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "registry=$REGISTRY" >> "$GITHUB_OUTPUT"
-          echo "target=$REGISTRY/$NAMESPACE/$REPO:$TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "source=$SRC"
+            echo "mirror=$MIRROR"
+            echo "source_tag=$SRC_TAG"
+            echo "tag=$TAG"
+            echo "registry=$REGISTRY"
+            echo "target=$REGISTRY/$NAMESPACE/$REPO:$TAG"
+          } >> "$GITHUB_OUTPUT"
+
           {
             echo "### 镜像同步"
             echo ""
             echo "- 源：\`$SRC\`"
+            echo "- 备用源：\`$MIRROR\`"
             echo "- 目标：\`$REGISTRY/$NAMESPACE/$REPO:$TAG\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install skopeo
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo
+          skopeo --version
+
+      # 阶段一：只下载到本地 OCI 目录。skopeo 会跳过已存在的 blob，
+      # 所以重试是增量的，断流不会从头再来。
+      - name: Pull source image to local OCI layout
+        id: pull
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p "$OCI_LAYOUT"
+          CANDIDATES=(
+            "${{ steps.params.outputs.source }}"
+            "${{ steps.params.outputs.mirror }}"
+          )
+
+          ok=0
+          for cand in "${CANDIDATES[@]}"; do
+            [ -n "$cand" ] || continue
+            echo "::group::从 $cand 拉取"
+            for i in $(seq 1 6); do
+              echo "--- $cand 第 $i/6 次尝试"
+              if skopeo copy --all --retry-times 5 "docker://$cand" "oci:${OCI_LAYOUT}:src"; then
+                echo "拉取成功：$cand"
+                ok=1
+                break
+              fi
+              echo "本次失败，已有 blob 会被下次复用"
+              sleep $((i * 5))
+            done
+            echo "::endgroup::"
+            [ "$ok" -eq 1 ] && break
+            echo "::warning::$cand 多次失败，切换备用源"
+          done
+
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::所有源都拉取失败"
+            exit 1
+          fi
+
+          du -sh "$OCI_LAYOUT"
+          echo "pulled=1" >> "$GITHUB_OUTPUT"
 
       - name: Login to target registry
         uses: docker/login-action@v3
@@ -90,39 +157,36 @@ jobs:
           username: ${{ secrets.TENCENTYUN_REGISTRY_USERNAME }}
           password: ${{ secrets.TENCENTYUN_REGISTRY_PASSWORD }}
 
-      - name: Install skopeo
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq skopeo
-          skopeo --version
-
-      # 逐级回退：先原样搬 multi-arch index，再转 Docker schema2，最后只取 amd64
-      - name: Copy image
-        id: copy
+      # 阶段二：本地目录推到目标仓库，网络抖动只影响这一半，不用重新下载
+      - name: Push local layout to target registry
+        id: push
         shell: bash
         run: |
           set -uo pipefail
-          SRC="${{ steps.params.outputs.source }}"
           DST="${{ steps.params.outputs.target }}"
 
-          try_copy() {
+          push_with() {
             local label="$1"; shift
-            echo "::group::skopeo copy ($label)"
-            if skopeo copy --retry-times 3 "$@" "docker://$SRC" "docker://$DST"; then
-              echo "::endgroup::"
-              echo "mode=$label" >> "$GITHUB_OUTPUT"
-              return 0
-            fi
+            echo "::group::推送（$label）"
+            for i in $(seq 1 5); do
+              echo "--- 第 $i/5 次尝试"
+              if skopeo copy "$@" --retry-times 5 "oci:${OCI_LAYOUT}:src" "docker://$DST"; then
+                echo "::endgroup::"
+                echo "mode=$label" >> "$GITHUB_OUTPUT"
+                return 0
+              fi
+              sleep $((i * 5))
+            done
             echo "::endgroup::"
-            echo "::warning::$label 失败，尝试下一档"
+            echo "::warning::$label 推送失败"
             return 1
           }
 
-          try_copy "all-oci" --all && exit 0
-          try_copy "all-v2s2" --all --format v2s2 && exit 0
-          try_copy "amd64-v2s2" --override-os linux --override-arch amd64 --format v2s2 && exit 0
+          push_with "all-oci"  --all && exit 0
+          push_with "all-v2s2" --all --format v2s2 && exit 0
+          push_with "amd64-v2s2" --override-os linux --override-arch amd64 --format v2s2 && exit 0
 
-          echo "::error::所有复制方式都失败"
+          echo "::error::所有推送方式都失败"
           exit 1
 
       - name: Verify pushed image
@@ -133,7 +197,7 @@ jobs:
           skopeo inspect --raw "docker://$DST" > /tmp/manifest.json
           echo "已推送：$DST"
           python3 - <<'PY'
-          import json, os
+          import json
           d = json.load(open('/tmp/manifest.json'))
           ms = d.get('manifests')
           if ms:
@@ -142,5 +206,10 @@ jobs:
               print("平台：" + ", ".join(plats))
           else:
               print("平台：单架构 manifest")
+          print("digest：" + (d.get('config',{}).get('digest') or '索引摘要'))
           PY
-          echo "- 验证通过：\`$DST\`（${{ steps.copy.outputs.mode }}）" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "- 拉取：完成"
+            echo "- 推送：\`$DST\`（${{ steps.push.outputs.mode }}）"
+            echo "- 验证：manifest 可读"
+          } >> "$GITHUB_STEP_SUMMARY"
